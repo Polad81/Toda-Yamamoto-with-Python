@@ -1,0 +1,226 @@
+Adapted from Matt L's code.
+References
+#https://github.com/likelyspurious/Toda-and-Yamamoto-Granger-Causality-Python/blob/main/Toda-Yamamoto-Granger-Causality-Python.ipynb
+#https://medium.com/@matt.lucich/implementing-toda-yamamoto-granger-causality-in-python-2a3d6021ca86
+########library
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import scipy.stats as stats
+import statsmodels.api as sm
+import statsmodels.tsa.stattools as stm
+
+from statsmodels.tsa.api import VAR
+from statsmodels.tsa.stattools import adfuller, lagmat2ds
+from statsmodels.graphics.tsaplots import plot_acf
+from statsmodels.tsa.vector_ar import output, plotting, util
+from statsmodels.tsa.vector_ar.vecm import coint_johansen
+from statsmodels.tsa.tsatools import duplication_matrix, unvec, vec
+##########data download
+from IPython.display import display, HTML
+display(HTML("<style>.container { width:100% !important; }</style>"))
+data = pd.read_excel("path/sdt1.xlsx",  "Sayfa17")
+data['Date'] = pd.to_datetime(data['Date'], format='%Y')
+data.set_index('Date', inplace=True)
+data['lnFD'] = np.log(data['FD'])
+data['lnK'] = np.log(data['K'])
+data['lnL'] = np.log(data['L'])
+data['lnLK'] = np.log(data['LK'])
+data['lnind'] = np.log(data['ind'])
+data = data[['FD', 'lnK', 'lnL', 'LK', 'lnind']]
+
+######Determine the order of integration of each series and the maximum order of integration.
+import pandas as pd
+from statsmodels.tsa.stattools import adfuller
+
+def find_order_of_integration(series, series_name, max_diff=3, significance_level=0.01):
+    """
+    Determines the order of integration of a series up to a specified 
+    maximum order using Augmented Dickey-Fuller test
+    """    
+    # Check up to max_diff times if the series becomes stationary
+    for d in range(max_diff + 1):
+        if d > 0:
+            diff_series = series.diff(d).dropna()  # Differencing the series d times
+        else:
+            diff_series = series.dropna()  # No differencing if d is 0
+        
+        adf_test = adfuller(diff_series, regression='ct', autolag='AIC')
+        p_value = adf_test[1]  # p-value of the ADF test
+        
+        print(f"Series: {series_name}, Lag: {d}, P-value: {p_value:.3f}")
+        
+        if p_value < significance_level:
+            return d
+    return None
+
+def find_max_order(df):
+    """Determines the maximum order of integration.""" 
+    order_of_integrations = []
+    for col in df.columns:
+        order = find_order_of_integration(df[col], col)
+        if order is not None:
+            order_of_integrations.append(order)
+    if order_of_integrations:  # Check if the list is not empty
+        return max(order_of_integrations)
+    else:
+        return 0
+
+
+
+########
+max_order = find_max_order(data)
+print("Maximum order of integration: ", max_order)
+#########Select the optimal lag length (k) for VAR model
+frequency = pd.infer_freq(data.index)
+model_lag_select = VAR(data, freq=frequency)
+lag_order_results = model_lag_select.select_order(3)
+lag_order = lag_order_results.selected_orders['aic']
+########### diagnostic test
+results = model_lag_select.fit(maxlags=3, ic='aic')
+print(results.test_normality())
+print(results.test_whiteness())
+######### defination of max_order
+result = coint_johansen(data, det_order=1, k_ar_diff=(lag_order-1))
+
+def estimate_p_value(stat, cv):
+    if stat > cv[2]:  # Greater than the 99% critical value
+        return 0.01
+    elif stat > cv[1]:  # Greater than the 95% critical value
+        return np.interp(stat, [cv[1], cv[2]], [0.05, 0.01])
+    elif stat > cv[0]:  # Greater than the 90% critical value
+        return np.interp(stat, [cv[0], cv[1]], [0.10, 0.05])
+    else:
+        return 1.0  # Not significant at the 90% level
+
+# Assuming 'result' is obtained from coint_johansen
+trace_stat = result.lr1
+max_eigen_stat = result.lr2
+critical_values = result.cvt  # Corresponds to 90%, 95%, and 99% confidence
+
+# Calculate p-values for trace and max-eigen statistics
+trace_p_values = [estimate_p_value(ts, cvs) for ts, cvs in zip(trace_stat, critical_values)]
+max_eigen_p_values = [estimate_p_value(me, cvs) for me, cvs in zip(max_eigen_stat, critical_values)]
+    
+# Display results with estimated p-values
+print("Trace statistics and estimated p-values:")
+for stat, cv, p_val in zip(trace_stat, critical_values, trace_p_values):
+    print(f"Trace Statistic: {stat:.3f}, Critical Values: {cv}, Estimated p-value: {p_val:.3f}")
+
+print("\nMax-Eigen statistics and estimated p-values:")
+for stat, cv, p_val in zip(max_eigen_stat, critical_values, max_eigen_p_values):
+    print(f"Max-Eigen Statistic: {stat:.3f}, Critical Values: {cv}, Estimated p-value: {p_val:.3f}")
+#########Estimate the VAR with extra lags
+k = lag_order + max_order
+model = VAR(data, freq=frequency)
+var_model = model.fit(k)
+print(var_model.summary())
+####### Testing for Granger Causality with extra lags not included in Wald Test
+import numpy as np
+import pandas as pd
+from scipy import stats
+from statsmodels.tsa.vector_ar.var_model import util
+
+def test_causality_modified(model, max_order, caused, causing=None, kind="wald", signif=0.05):
+    """
+    This function is a modified version of the test_causality function in statsmodels for multiple variables.
+    See the following URL for a proper docstring: 
+    https://www.statsmodels.org/stable/_modules/statsmodels/tsa/vector_ar/var_model.html#VARResults.test_causality 
+    """
+    if max_order == 0:
+        slice_int = None
+    else: 
+        slice_int = max_order * -4
+
+    if not (0 < signif < 1):
+        raise ValueError("signif has to be between 0 and 1")
+
+    allowed_types = (str, int)
+
+    if isinstance(caused, allowed_types):
+        caused = [caused]
+    if not all(isinstance(c, allowed_types) for c in caused):
+        raise TypeError(
+            "caused has to be of type string or int (or a "
+            "sequence of these types)."
+        )
+    caused = [model.names[c] if type(c) is int else c for c in caused]
+    caused_ind = [util.get_index(model.names, c) for c in caused]
+
+    if causing is not None:
+        if isinstance(causing, allowed_types):
+            causing = [causing]
+        if not all(isinstance(c, allowed_types) for c in causing):
+            raise TypeError(
+                "causing has to be of type string or int (or "
+                "a sequence of these types) or None."
+            )
+        causing = [model.names[c] if type(c) is int else c for c in causing]
+        causing_ind = [util.get_index(model.names, c) for c in causing]
+    else:
+        causing_ind = [i for i in range(model.neqs) if i not in caused_ind]
+        causing = [model.names[c] for c in causing_ind]
+
+    k, p = model.neqs, model.k_ar
+
+    if p == 0:
+        err = "Cannot test Granger Causality in a model with 0 lags."
+        raise RuntimeError(err)
+
+    p = p - max_order
+
+    # number of restrictions
+    num_restr = len(causing) * len(caused) * p
+    num_det_terms = model.k_exog
+
+    # Make restriction matrix
+    C = np.zeros((num_restr, k * (p + num_det_terms)), dtype=float)
+    row = 0
+    for j in range(p):
+        for ing_ind in causing_ind:
+            for ed_ind in caused_ind:
+                C[row, k * j + ing_ind] = 1
+                row += 1
+
+    model_params = pd.DataFrame(model.params)
+
+    params_transposed = model_params.T.values.flatten()
+                
+    # Lütkepohl 3.6.5
+    Cb = np.dot(C, params_transposed[:len(C.T)])
+    middle = np.linalg.inv(C @ model.cov_params().iloc[:len(C.T), :len(C.T)] @ C.T)
+
+    # wald statistic
+    lam_wald = statistic = Cb @ middle @ Cb
+
+    if kind.lower() == "wald":
+        df = num_restr
+        dist = stats.chi2(df)
+    elif kind.lower() == "f":
+        statistic = lam_wald / num_restr
+        df = (num_restr, k * model.df_resid)
+        dist = stats.f(*df)
+    else:
+        raise ValueError("kind %s not recognized" % kind)
+
+    pvalue = dist.sf(statistic)
+    crit_value = dist.ppf(1 - signif)
+    
+    print("Number of lags used: ", p)
+    print("pvalue: ", pvalue.round(3))
+    print("statistic: ", statistic.round(3))
+    print("crit_value: ", crit_value.round(3))
+
+    return causing, caused, statistic, crit_value, pvalue, df, signif
+
+def vec(matrix):
+    """
+    Vectorize a matrix by stacking its columns into a single column vector.
+    """
+    return matrix.ravel()
+###########
+causing, caused, statistic, crit_value, pvalue, df, signif = test_causality_modified(var_model, max_order, causing="lnind", caused="lnK", kind="wald")
+#Number of lags used:  3
+#pvalue:  0.0
+#statistic:  3062.692
+#crit_value:  7.815
